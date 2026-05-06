@@ -202,91 +202,95 @@ def main() -> None:
     }
 
     db = GatewayDB(database_url)
-    db.init()
+    db.open()
+    try:
+        db.init()
 
-    for tenant in tenants:
-        # Upsert active tenant rows and create missing wallets. Existing wallets
-        # are not topped up by sync; only a newly-created wallet gets the initial seed.
-        db.upsert_company_mapping(
-            openwebui_api_key=tenant["openwebui_api_key"],
-            company_id=tenant["company_id"],
-            company_name=tenant["company_name"],
-            team_id=tenant["team_id"],
-            litellm_url=tenant["litellm_url"],
-            default_max_tokens=tenant["default_max_tokens"],
-            is_active=1,
-        )
-        wallet_created = db.ensure_wallet_account(
-            tenant["company_id"],
-            low_balance_threshold=tenant["low_balance_threshold"],
-        )
-        if wallet_created and tenant["initial_balance_tokens"] > 0:
-            db.adjust_wallet_balance(
+        for tenant in tenants:
+            # Upsert active tenant rows and create missing wallets. Existing wallets
+            # are not topped up by sync; only a newly-created wallet gets the initial seed.
+            db.upsert_company_mapping(
+                openwebui_api_key=tenant["openwebui_api_key"],
+                company_id=tenant["company_id"],
+                company_name=tenant["company_name"],
+                team_id=tenant["team_id"],
+                litellm_url=tenant["litellm_url"],
+                default_max_tokens=tenant["default_max_tokens"],
+                is_active=1,
+            )
+            wallet_created = db.ensure_wallet_account(
                 tenant["company_id"],
-                tenant["initial_balance_tokens"],
-                "purchase",
-                metadata={"source": "control_plane_sync"},
-                idempotency_key=f"control-plane-sync:wallet-seed:{tenant['company_id']}",
+                low_balance_threshold=tenant["low_balance_threshold"],
+            )
+            if wallet_created and tenant["initial_balance_tokens"] > 0:
+                db.adjust_wallet_balance(
+                    tenant["company_id"],
+                    tenant["initial_balance_tokens"],
+                    "purchase",
+                    metadata={"source": "control_plane_sync"},
+                    idempotency_key=f"control-plane-sync:wallet-seed:{tenant['company_id']}",
+                )
+
+        if sync_prune_mode == "deactivate":
+            # Deactivation keeps historical rows while removing them from active auth.
+            desired_keys = {tenant["openwebui_api_key"] for tenant in tenants}
+            for existing_key in db.list_company_mapping_keys():
+                if existing_key not in desired_keys:
+                    db.deactivate_company_mapping(existing_key)
+
+        for model in models:
+            # Model registry rows define tokenizer identity, backend model name, and
+            # optional default route for a logical model.
+            db.upsert_model_registry_entry(
+                logical_model_id=model["logical_model_id"],
+                backend_model=model["backend_model"],
+                tokenizer_repo=model["tokenizer_repo"],
+                tokenizer_revision=model["tokenizer_revision"],
+                model_policy_cap=model["model_policy_cap"],
+                route_target=model["route_target"],
+                is_active=1,
             )
 
-    if sync_prune_mode == "deactivate":
-        # Deactivation keeps historical rows while removing them from active auth.
-        desired_keys = {tenant["openwebui_api_key"] for tenant in tenants}
-        for existing_key in db.list_company_mapping_keys():
-            if existing_key not in desired_keys:
-                db.deactivate_company_mapping(existing_key)
+        if sync_prune_mode == "deactivate":
+            # Models removed from desired state stop being assignable without erasing history.
+            for logical_model_id in db.list_model_registry_ids():
+                if logical_model_id not in model_ids:
+                    db.deactivate_model_registry_entry(logical_model_id)
 
-    for model in models:
-        # Model registry rows define tokenizer identity, backend model name, and
-        # optional default route for a logical model.
-        db.upsert_model_registry_entry(
-            logical_model_id=model["logical_model_id"],
-            backend_model=model["backend_model"],
-            tokenizer_repo=model["tokenizer_repo"],
-            tokenizer_revision=model["tokenizer_revision"],
-            model_policy_cap=model["model_policy_cap"],
-            route_target=model["route_target"],
-            is_active=1,
+        for company_id, logical_model_id in sorted(desired_assignments):
+            # Assignment rows can override route_target per company/model pair, which
+            # is how one logical model can route to tenant-specific vLLM services.
+            db.upsert_tenant_model_assignment(
+                company_id,
+                logical_model_id,
+                route_target=desired_assignments[(company_id, logical_model_id)],
+                is_active=1,
+            )
+
+        if sync_prune_mode == "deactivate":
+            # Removed assignments immediately stop access for that company/model pair.
+            for company_id, logical_model_id in db.list_tenant_model_assignment_keys():
+                if (company_id, logical_model_id) not in desired_assignments:
+                    db.deactivate_tenant_model_assignment(company_id, logical_model_id)
+
+        desired_state_sha256 = hashlib.sha256(
+            json.dumps({"models": models, "tenants": tenants, "sync_prune_mode": sync_prune_mode}, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        # Store a fingerprint of the normalized input so operators can tell exactly
+        # which desired-state version last synced.
+        db.record_control_plane_sync_run(
+            desired_state_sha256=desired_state_sha256,
+            sync_prune_mode=sync_prune_mode,
+            tenant_count=len(tenants),
+            model_count=len(models),
+            assignment_count=len(desired_assignments),
+            metadata={
+                "company_ids": [tenant["company_id"] for tenant in tenants],
+                "logical_model_ids": sorted(model_ids),
+            },
         )
-
-    if sync_prune_mode == "deactivate":
-        # Models removed from desired state stop being assignable without erasing history.
-        for logical_model_id in db.list_model_registry_ids():
-            if logical_model_id not in model_ids:
-                db.deactivate_model_registry_entry(logical_model_id)
-
-    for company_id, logical_model_id in sorted(desired_assignments):
-        # Assignment rows can override route_target per company/model pair, which
-        # is how one logical model can route to tenant-specific vLLM services.
-        db.upsert_tenant_model_assignment(
-            company_id,
-            logical_model_id,
-            route_target=desired_assignments[(company_id, logical_model_id)],
-            is_active=1,
-        )
-
-    if sync_prune_mode == "deactivate":
-        # Removed assignments immediately stop access for that company/model pair.
-        for company_id, logical_model_id in db.list_tenant_model_assignment_keys():
-            if (company_id, logical_model_id) not in desired_assignments:
-                db.deactivate_tenant_model_assignment(company_id, logical_model_id)
-
-    desired_state_sha256 = hashlib.sha256(
-        json.dumps({"models": models, "tenants": tenants, "sync_prune_mode": sync_prune_mode}, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    # Store a fingerprint of the normalized input so operators can tell exactly
-    # which desired-state version last synced.
-    db.record_control_plane_sync_run(
-        desired_state_sha256=desired_state_sha256,
-        sync_prune_mode=sync_prune_mode,
-        tenant_count=len(tenants),
-        model_count=len(models),
-        assignment_count=len(desired_assignments),
-        metadata={
-            "company_ids": [tenant["company_id"] for tenant in tenants],
-            "logical_model_ids": sorted(model_ids),
-        },
-    )
+    finally:
+        db.close()
 
     print(
         f"control plane sync complete; tenants={len(tenants)} models={len(models)} assignments={len(desired_assignments)}"

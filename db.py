@@ -10,6 +10,8 @@ from config import (
     LEDGER_STATUS_COMMITTED,
     LEDGER_STATUS_RECONCILED,
     ModelConfig,
+    USAGE_STATUS_RECONCILED,
+    USAGE_STATUS_RECONCILIATION_PENDING,
     USAGE_STATUS_PENDING,
     bool_to_int,
     db_path_from_url,
@@ -67,15 +69,24 @@ class GatewayDB:
         self.db_path = db_path_from_url(database_url) if self.backend == "sqlite" else None
         self._pg = None
         self._pg_dict_row = None
+        self._pg_pool = None
 
         if self.backend == "postgres":
             try:
                 import psycopg
+                from psycopg_pool import ConnectionPool
                 from psycopg.rows import dict_row
             except ImportError as exc:
-                raise RuntimeError("psycopg is required for postgresql DATABASE_URL") from exc
+                raise RuntimeError("psycopg and psycopg_pool are required for postgresql DATABASE_URL") from exc
             self._pg = psycopg
             self._pg_dict_row = dict_row
+            self._pg_pool = ConnectionPool(
+                conninfo=self.database_url,
+                kwargs={"row_factory": dict_row},
+                min_size=1,
+                max_size=int(os.getenv("GATEWAY_DB_POOL_MAX_SIZE", "10")),
+                open=False,
+            )
 
     def _detect_backend(self, database_url: str) -> str:
         # Keep backend detection explicit so unsupported URLs fail during startup.
@@ -96,14 +107,12 @@ class GatewayDB:
     @contextmanager
     def _connect(self):
         # `@contextmanager` turns this generator into a `with` block helper.
-        # Callers receive a connection object and this helper closes it afterward.
+        # Callers receive a connection object. Postgres connections come from a
+        # pool so request-time DB calls do not pay connection setup cost.
         if self.backend == "postgres":
-            assert self._pg is not None and self._pg_dict_row is not None
-            conn = self._pg.connect(self.database_url, row_factory=self._pg_dict_row)
-            try:
+            assert self._pg_pool is not None
+            with self._pg_pool.connection() as conn:
                 yield conn
-            finally:
-                conn.close()
             return
 
         assert self.db_path is not None
@@ -128,6 +137,14 @@ class GatewayDB:
             except Exception:
                 conn.rollback()
                 raise
+
+    def open(self) -> None:
+        if self._pg_pool is not None:
+            self._pg_pool.open(wait=True)
+
+    def close(self) -> None:
+        if self._pg_pool is not None:
+            self._pg_pool.close()
 
     def _fetchone(self, query: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         # Return one database row as a plain dict so callers do not depend on a driver-specific row type.
@@ -550,6 +567,50 @@ class GatewayDB:
             preload=False,
         )
 
+    def resolve_request_model_for_estimation(self, gateway_key: str, logical_model_id: str) -> tuple[dict[str, Any], ModelConfig] | None:
+        row = self._fetchone(
+            """
+            SELECT ctm.openwebui_api_key, ctm.company_id, ctm.company_name, ctm.team_id, ctm.litellm_url,
+                   ctm.default_max_tokens, ctm.is_active, ctm.created_at, ctm.updated_at,
+                   mr.logical_model_id, mr.backend_model, mr.tokenizer_repo, mr.tokenizer_revision,
+                   mr.model_policy_cap, tma.route_target
+            FROM company_team_map ctm
+            INNER JOIN tenant_model_assignments tma
+                ON tma.company_id = ctm.company_id
+            INNER JOIN model_registry mr
+                ON mr.logical_model_id = tma.logical_model_id
+            WHERE ctm.openwebui_api_key = ?
+              AND tma.logical_model_id = ?
+              AND ctm.is_active = 1
+              AND mr.is_active = 1
+              AND tma.is_active = 1
+            """,
+            (gateway_key, logical_model_id),
+        )
+        if row is None:
+            return None
+        company_mapping = {
+            "openwebui_api_key": row["openwebui_api_key"],
+            "company_id": row["company_id"] or row["company_name"],
+            "company_name": row["company_name"],
+            "team_id": row["team_id"],
+            "litellm_url": row.get("litellm_url"),
+            "default_max_tokens": row.get("default_max_tokens"),
+            "is_active": row.get("is_active"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        model_config = ModelConfig(
+            logical_model_id=row["logical_model_id"],
+            backend_model=row["backend_model"],
+            tokenizer_repo=row["tokenizer_repo"],
+            tokenizer_revision=row["tokenizer_revision"],
+            route=row.get("route_target"),
+            model_policy_cap=int(row["model_policy_cap"]),
+            preload=False,
+        )
+        return company_mapping, model_config
+
     def list_openai_models_for_company(self, company_id: str) -> dict[str, Any]:
         rows = self._fetchall(
             """
@@ -756,6 +817,197 @@ class GatewayDB:
             (company_id,),
         )
 
+    def admit_request(
+        self,
+        *,
+        gateway_key: str,
+        logical_model_id: str,
+        request_id: str,
+        user_id: str | None,
+        expected_backend_model: str,
+        expected_tokenizer_repo: str,
+        expected_tokenizer_revision: str | None,
+        estimated_prompt_tokens: int,
+        estimation_method: str,
+        requested_completion_cap: int | None,
+        stream: bool,
+        path: str,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        reserve_idempotency_key = f"reserve:{request_id}"
+
+        with self._transaction() as conn:
+            row = conn.execute(
+                self._sql(
+                    """
+                    SELECT ctm.openwebui_api_key, ctm.company_id, ctm.company_name, ctm.team_id, ctm.litellm_url,
+                           ctm.default_max_tokens, ctm.is_active, ctm.created_at, ctm.updated_at,
+                           mr.logical_model_id, mr.backend_model, mr.tokenizer_repo, mr.tokenizer_revision,
+                           mr.model_policy_cap, tma.route_target
+                    FROM company_team_map ctm
+                    INNER JOIN tenant_model_assignments tma
+                        ON tma.company_id = ctm.company_id
+                    INNER JOIN model_registry mr
+                        ON mr.logical_model_id = tma.logical_model_id
+                    WHERE ctm.openwebui_api_key = ?
+                      AND tma.logical_model_id = ?
+                      AND ctm.is_active = 1
+                      AND mr.is_active = 1
+                      AND tma.is_active = 1
+                    """
+                ),
+                (gateway_key, logical_model_id),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=403, detail="Requested model is not assigned to this company")
+            row = dict(row)
+
+            company_id = row["company_id"] or row["company_name"]
+            model_config = ModelConfig(
+                logical_model_id=row["logical_model_id"],
+                backend_model=row["backend_model"],
+                tokenizer_repo=row["tokenizer_repo"],
+                tokenizer_revision=row["tokenizer_revision"],
+                route=row.get("route_target"),
+                model_policy_cap=int(row["model_policy_cap"]),
+                preload=False,
+            )
+            if not model_config.route:
+                raise HTTPException(status_code=503, detail="Assigned model has no route_target configured")
+            if (
+                model_config.backend_model != expected_backend_model
+                or model_config.tokenizer_repo != expected_tokenizer_repo
+                or model_config.tokenizer_revision != expected_tokenizer_revision
+            ):
+                raise HTTPException(status_code=409, detail="Model assignment changed during admission; retry request")
+
+            wallet = self._lock_wallet_account(conn, company_id)
+            available_tokens = int(wallet["available_tokens"])
+            reserved_tokens = int(wallet["reserved_tokens"])
+            if wallet.get("status") != "active":
+                raise HTTPException(status_code=403, detail="Wallet account is not active")
+            remaining_after_prompt = available_tokens - estimated_prompt_tokens
+            if remaining_after_prompt < 0:
+                raise HTTPException(
+                    status_code=402,
+                    detail=build_prepaid_quota_error_detail(
+                        required_tokens=estimated_prompt_tokens,
+                        available_tokens=available_tokens,
+                        reserved_tokens=reserved_tokens,
+                        exhausted_message="Insufficient prepaid balance for prompt tokens",
+                    ),
+                )
+
+            reserved_completion_tokens = 0
+            if path in {"/v1/chat/completions", "/v1/completions"}:
+                completion_policy_cap = min(model_config.model_policy_cap, requested_completion_cap or model_config.model_policy_cap)
+                reserved_completion_tokens = min(completion_policy_cap, remaining_after_prompt)
+                if reserved_completion_tokens <= 0:
+                    raise HTTPException(
+                        status_code=402,
+                        detail=build_prepaid_quota_error_detail(
+                            required_tokens=estimated_prompt_tokens + 1,
+                            available_tokens=available_tokens,
+                            reserved_tokens=reserved_tokens,
+                            exhausted_message="Insufficient prepaid balance for completion tokens",
+                        ),
+                    )
+
+            reserved_total_tokens = estimated_prompt_tokens + reserved_completion_tokens
+            if reserved_total_tokens <= 0:
+                raise HTTPException(status_code=400, detail="Reservation must be positive")
+
+            existing = conn.execute(
+                self._sql("SELECT idempotency_key FROM wallet_ledger WHERE idempotency_key = ?"),
+                (reserve_idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                if available_tokens < reserved_total_tokens:
+                    raise HTTPException(
+                        status_code=402,
+                        detail=build_prepaid_quota_error_detail(
+                            required_tokens=reserved_total_tokens,
+                            available_tokens=available_tokens,
+                            reserved_tokens=reserved_tokens,
+                            exhausted_message="Insufficient prepaid balance for reservation",
+                        ),
+                    )
+                conn.execute(
+                    self._sql(
+                        """
+                        UPDATE wallet_accounts
+                        SET available_tokens = ?, reserved_tokens = ?, version = version + 1, updated_at = ?
+                        WHERE company_id = ?
+                        """
+                    ),
+                    (available_tokens - reserved_total_tokens, reserved_tokens + reserved_total_tokens, now, company_id),
+                )
+                conn.execute(
+                    self._sql(
+                        """
+                        INSERT INTO wallet_ledger (id, company_id, request_id, entry_type, delta_tokens, status, idempotency_key, metadata_json, created_at)
+                        VALUES (?, ?, ?, 'reserve', ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (
+                        str(uuid.uuid4()),
+                        company_id,
+                        request_id,
+                        -reserved_total_tokens,
+                        LEDGER_STATUS_COMMITTED,
+                        reserve_idempotency_key,
+                        safe_json_dumps({"logical_model_id": logical_model_id, "backend_model": model_config.backend_model, "path": path}),
+                        now,
+                    ),
+                )
+
+            conn.execute(
+                self._sql(
+                    """
+                    INSERT INTO usage_events (
+                        request_id, company_id, user_id, logical_model_id, backend_model, tokenizer_repo, tokenizer_revision,
+                        estimated_prompt_tokens, estimation_method, reserved_completion_tokens, actual_prompt_tokens, actual_completion_tokens,
+                        actual_total_tokens, latency_ms, status, stream, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+                    ON CONFLICT(request_id) DO NOTHING
+                    """
+                ),
+                (
+                    request_id,
+                    company_id,
+                    user_id,
+                    model_config.logical_model_id,
+                    model_config.backend_model,
+                    model_config.tokenizer_repo,
+                    model_config.tokenizer_revision,
+                    estimated_prompt_tokens,
+                    estimation_method,
+                    reserved_completion_tokens,
+                    USAGE_STATUS_PENDING,
+                    bool_to_int(stream),
+                    now,
+                    now,
+                ),
+            )
+
+        return {
+            "company_mapping": {
+                "openwebui_api_key": row["openwebui_api_key"],
+                "company_id": company_id,
+                "company_name": row["company_name"],
+                "team_id": row["team_id"],
+                "litellm_url": row.get("litellm_url"),
+                "default_max_tokens": row.get("default_max_tokens"),
+                "is_active": row.get("is_active"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            },
+            "model_config": model_config,
+            "reserved_completion_tokens": reserved_completion_tokens,
+            "reserved_total_tokens": reserved_total_tokens,
+        }
+
     def create_pending_usage_event(
         self,
         request_id: str,
@@ -811,33 +1063,23 @@ class GatewayDB:
     ) -> None:
         # Usage events are filled in over time: pending at reservation, then
         # completed/reconciled/failed later. `None` means "keep the current value".
-        current = self._fetchone(
-            """
-            SELECT request_id, actual_prompt_tokens, actual_completion_tokens, actual_total_tokens, latency_ms, status
-            FROM usage_events
-            WHERE request_id = ?
-            """,
-            (request_id,),
-        )
-        if current is None:
-            return
         self._execute(
             """
             UPDATE usage_events
-            SET actual_prompt_tokens = ?,
-                actual_completion_tokens = ?,
-                actual_total_tokens = ?,
-                latency_ms = ?,
-                status = ?,
+            SET actual_prompt_tokens = COALESCE(?, actual_prompt_tokens),
+                actual_completion_tokens = COALESCE(?, actual_completion_tokens),
+                actual_total_tokens = COALESCE(?, actual_total_tokens),
+                latency_ms = COALESCE(?, latency_ms),
+                status = COALESCE(?, status),
                 updated_at = ?
             WHERE request_id = ?
             """,
             (
-                actual_prompt_tokens if actual_prompt_tokens is not None else current.get("actual_prompt_tokens"),
-                actual_completion_tokens if actual_completion_tokens is not None else current.get("actual_completion_tokens"),
-                actual_total_tokens if actual_total_tokens is not None else current.get("actual_total_tokens"),
-                latency_ms if latency_ms is not None else current.get("latency_ms"),
-                status or current.get("status"),
+                actual_prompt_tokens,
+                actual_completion_tokens,
+                actual_total_tokens,
+                latency_ms,
+                status,
                 utcnow(),
                 request_id,
             ),
@@ -985,6 +1227,212 @@ class GatewayDB:
                 ),
                 (str(uuid.uuid4()), company_id, request_id, reserved_total_tokens, LEDGER_STATUS_COMMITTED, idempotency_key, metadata_json, now),
             )
+
+    def release_request_without_usage(
+        self,
+        company_id: str,
+        request_id: str,
+        reserved_total_tokens: int,
+        *,
+        latency_ms: int,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        idempotency_key = f"release:{request_id}:full"
+        now = utcnow()
+        metadata_json = safe_json_dumps(metadata or {})
+
+        with self._transaction() as conn:
+            existing = conn.execute(
+                self._sql("SELECT idempotency_key FROM wallet_ledger WHERE idempotency_key = ?"),
+                (idempotency_key,),
+            ).fetchone()
+            if existing is None and reserved_total_tokens > 0:
+                wallet = self._lock_wallet_account(conn, company_id)
+                available_tokens = int(wallet["available_tokens"])
+                reserved_tokens = int(wallet["reserved_tokens"])
+                if reserved_tokens < reserved_total_tokens:
+                    raise HTTPException(status_code=409, detail="Reserved balance is inconsistent")
+                conn.execute(
+                    self._sql(
+                        """
+                        UPDATE wallet_accounts
+                        SET available_tokens = ?, reserved_tokens = ?, version = version + 1, updated_at = ?
+                        WHERE company_id = ?
+                        """
+                    ),
+                    (available_tokens + reserved_total_tokens, reserved_tokens - reserved_total_tokens, now, company_id),
+                )
+                conn.execute(
+                    self._sql(
+                        """
+                        INSERT INTO wallet_ledger (id, company_id, request_id, entry_type, delta_tokens, status, idempotency_key, metadata_json, created_at)
+                        VALUES (?, ?, ?, 'release', ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (str(uuid.uuid4()), company_id, request_id, reserved_total_tokens, LEDGER_STATUS_COMMITTED, idempotency_key, metadata_json, now),
+                )
+
+            conn.execute(
+                self._sql(
+                    """
+                    UPDATE usage_events
+                    SET latency_ms = ?, status = ?, updated_at = ?
+                    WHERE request_id = ?
+                    """
+                ),
+                (latency_ms, status, now, request_id),
+            )
+
+    def settle_known_usage(
+        self,
+        company_id: str,
+        request_id: str,
+        reserved_total_tokens: int,
+        *,
+        actual_prompt_tokens: int | None,
+        actual_completion_tokens: int | None,
+        actual_total_tokens: int,
+        latency_ms: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        if actual_total_tokens < 0:
+            raise HTTPException(status_code=500, detail="Actual usage cannot be negative")
+        release_tokens = max(reserved_total_tokens - actual_total_tokens, 0)
+        extra_charge_tokens = max(actual_total_tokens - reserved_total_tokens, 0)
+        finalize_idempotency = f"finalize:{request_id}"
+        release_idempotency = f"release:{request_id}:delta"
+        now = utcnow()
+        metadata_json = safe_json_dumps(metadata or {})
+
+        with self._transaction() as conn:
+            existing = conn.execute(
+                self._sql("SELECT idempotency_key FROM wallet_ledger WHERE idempotency_key = ?"),
+                (finalize_idempotency,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    self._sql(
+                        """
+                        UPDATE usage_events
+                        SET actual_prompt_tokens = ?,
+                            actual_completion_tokens = ?,
+                            actual_total_tokens = ?,
+                            latency_ms = ?,
+                            status = ?,
+                            updated_at = ?
+                        WHERE request_id = ?
+                        """
+                    ),
+                    (
+                        actual_prompt_tokens,
+                        actual_completion_tokens,
+                        actual_total_tokens,
+                        latency_ms,
+                        USAGE_STATUS_RECONCILED,
+                        now,
+                        request_id,
+                    ),
+                )
+                return USAGE_STATUS_RECONCILED
+
+            wallet = self._lock_wallet_account(conn, company_id)
+            available_tokens = int(wallet["available_tokens"])
+            reserved_tokens = int(wallet["reserved_tokens"])
+            if reserved_tokens < reserved_total_tokens or available_tokens < extra_charge_tokens:
+                conn.execute(
+                    self._sql(
+                        """
+                        UPDATE usage_events
+                        SET actual_prompt_tokens = ?,
+                            actual_completion_tokens = ?,
+                            actual_total_tokens = ?,
+                            latency_ms = ?,
+                            status = ?,
+                            updated_at = ?
+                        WHERE request_id = ?
+                        """
+                    ),
+                    (
+                        actual_prompt_tokens,
+                        actual_completion_tokens,
+                        actual_total_tokens,
+                        latency_ms,
+                        USAGE_STATUS_RECONCILIATION_PENDING,
+                        now,
+                        request_id,
+                    ),
+                )
+                return USAGE_STATUS_RECONCILIATION_PENDING
+
+            conn.execute(
+                self._sql(
+                    """
+                    UPDATE wallet_accounts
+                    SET available_tokens = ?, reserved_tokens = ?, version = version + 1, updated_at = ?
+                    WHERE company_id = ?
+                    """
+                ),
+                (
+                    available_tokens - extra_charge_tokens + release_tokens,
+                    reserved_tokens - reserved_total_tokens,
+                    now,
+                    company_id,
+                ),
+            )
+            conn.execute(
+                self._sql(
+                    """
+                    INSERT INTO wallet_ledger (id, company_id, request_id, entry_type, delta_tokens, status, idempotency_key, metadata_json, created_at)
+                    VALUES (?, ?, ?, 'finalize', ?, ?, ?, ?, ?)
+                    """
+                ),
+                (
+                    str(uuid.uuid4()),
+                    company_id,
+                    request_id,
+                    -extra_charge_tokens,
+                    LEDGER_STATUS_RECONCILED,
+                    finalize_idempotency,
+                    metadata_json,
+                    now,
+                ),
+            )
+            if release_tokens > 0:
+                conn.execute(
+                    self._sql(
+                        """
+                        INSERT INTO wallet_ledger (id, company_id, request_id, entry_type, delta_tokens, status, idempotency_key, metadata_json, created_at)
+                        VALUES (?, ?, ?, 'release', ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (str(uuid.uuid4()), company_id, request_id, release_tokens, LEDGER_STATUS_RECONCILED, release_idempotency, metadata_json, now),
+                )
+            conn.execute(
+                self._sql(
+                    """
+                    UPDATE usage_events
+                    SET actual_prompt_tokens = ?,
+                        actual_completion_tokens = ?,
+                        actual_total_tokens = ?,
+                        latency_ms = ?,
+                        status = ?,
+                        updated_at = ?
+                    WHERE request_id = ?
+                    """
+                ),
+                (
+                    actual_prompt_tokens,
+                    actual_completion_tokens,
+                    actual_total_tokens,
+                    latency_ms,
+                    USAGE_STATUS_RECONCILED,
+                    now,
+                    request_id,
+                ),
+            )
+
+        return USAGE_STATUS_RECONCILED
 
     def finalize_request(
         self,

@@ -199,6 +199,35 @@ def test_nonstream_request_rewrites_model_and_bills_actual_usage(tmp_path: Path)
     run_with_client(settings, make_transport(captured_requests), scenario)
 
 
+def test_request_completion_cap_reduces_reservation_and_forwarded_cap(tmp_path: Path):
+    captured_requests: list[dict] = []
+    settings = build_settings(tmp_path, initial_balance=100)
+
+    async def scenario(client):
+        seed_control_plane(client, initial_balance=100)
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer tenant-demo-key",
+                "x-gateway-user-id": "user-1",
+            },
+            json={
+                "model": "support-bot",
+                "max_tokens": 2,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 200
+        forwarded = captured_requests[0]
+        assert forwarded["max_tokens"] == 2
+        assert forwarded["max_completion_tokens"] == 2
+        usage_event = client.app.state.db.list_usage_events()[0]
+        assert usage_event["reserved_completion_tokens"] == 2
+
+    run_with_client(settings, make_transport(captured_requests), scenario)
+
+
 def test_unknown_model_rejected_before_upstream(tmp_path: Path):
     captured_requests: list[dict] = []
     settings = build_settings(tmp_path, initial_balance=100)
@@ -280,6 +309,52 @@ def test_assigned_model_without_route_fails_closed_before_upstream(tmp_path: Pat
         assert wallet["reserved_tokens"] == 0
 
     run_with_client(settings, make_transport(captured_requests), scenario)
+
+
+def test_upstream_connect_error_returns_503_and_releases_reservation(tmp_path: Path):
+    captured_urls: list[str] = []
+    settings = build_settings(tmp_path, initial_balance=100)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        raise httpx.ConnectError("All connection attempts failed", request=request)
+
+    async def scenario(client):
+        seed_control_plane(
+            client,
+            initial_balance=100,
+            route_target="http://vllm-tenant-demo-mistral-7b.test/v1",
+        )
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer tenant-demo-key"},
+            json={
+                "model": "support-bot",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 503
+        body = response.json()
+        request_id = body["error"].pop("request_id")
+        assert request_id
+        assert body == {
+            "error": {
+                "message": "Upstream model runtime is unavailable for logical_model_id 'support-bot'",
+                "type": "upstream_unavailable",
+                "code": "upstream_connection_failed",
+            }
+        }
+        assert captured_urls == ["http://vllm-tenant-demo-mistral-7b.test/v1/chat/completions"]
+
+        wallet = client.app.state.db.get_wallet("tenant-demo")
+        usage_event = client.app.state.db.list_usage_events()[0]
+        assert wallet["available_tokens"] == 100
+        assert wallet["reserved_tokens"] == 0
+        assert usage_event["request_id"] == request_id
+        assert usage_event["status"] == "failed"
+
+    run_with_client(settings, httpx.MockTransport(handler), scenario)
 
 
 def test_generation_rejected_when_completion_cap_is_zero(tmp_path: Path):
